@@ -92,6 +92,7 @@ def test_frozen_component_chain_reproduces_teacher_audio():
     student.eval()  # nn.Module defaults to training mode; LMGen asserts against that
 
     import sentencepiece
+    from moshi.utils.compile import no_cuda_graph
     text_tokenizer = sentencepiece.SentencePieceProcessor(TOKENIZER)
 
     def run(lm):
@@ -109,8 +110,21 @@ def test_frozen_component_chain_reproduces_teacher_audio():
                     frames.append(mimi.decode(tokens[:, 1:9]))
         return torch.cat(frames, dim=-1)
 
-    teacher_audio = run(teacher)
-    student_audio = run(student)
+    # CUDA graph capture is a performance optimization LMGen applies transparently
+    # (moshi/utils/compile.py's CUDAGraphed); this test cares only about numerical
+    # correctness. Running the teacher's LMGen and the student's LMGen sequentially in
+    # the SAME process -- needed here to compare their outputs directly -- is not a
+    # pattern any normal training/inference path exercises (training scores the teacher
+    # via plain forward_train, never LMGen; moshi.offline's teacher-vs-student benchmark
+    # runs each in its own subprocess). It surfaced a real CUDA stream-capture failure
+    # ("operation failed due to a previous error during capture", raised from
+    # torch.cuda.graphs.CUDAGraph.capture_end) that is about capture-protocol state, not
+    # a kernel bug -- CUDA_LAUNCH_BLOCKING does not help pinpoint it, since it is not an
+    # ordinary kernel launch error. Disabling CUDA graphs for this comparison sidesteps
+    # the whole class of problem and is free: this test runs 40 frames total.
+    with no_cuda_graph():
+        teacher_audio = run(teacher)
+        student_audio = run(student)
 
     assert teacher_audio.shape == student_audio.shape
     max_abs_diff = (teacher_audio - student_audio).abs().max().item()
