@@ -89,6 +89,7 @@ def test_frozen_component_chain_reproduces_teacher_audio():
     init_embeddings(teacher, student, identity)
     student.bridge.linear.weight.copy_(torch.eye(dim, device=device, dtype=student.bridge.linear.weight.dtype))
     torch.nn.init.ones_(student.bridge.norm.alpha)
+    student.eval()  # nn.Module defaults to training mode; LMGen asserts against that
 
     import sentencepiece
     text_tokenizer = sentencepiece.SentencePieceProcessor(TOKENIZER)

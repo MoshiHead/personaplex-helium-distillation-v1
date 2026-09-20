@@ -475,6 +475,30 @@ def sanity_check_student(
     then lets the student free-run for `num_frames` with a placeholder ("sine") input
     on the other-party channel, same convention used during prompt loading.
     """
+    # LMGen asserts the model is not in training mode; nn.Module defaults to training=True,
+    # so don't depend on the caller having called .eval() first (build_student_lm does, but a
+    # freshly-constructed StudentLMModel passed in directly would otherwise hit that assertion).
+    was_training = student.training
+    student.eval()
+    try:
+        return _sanity_check_student_impl(
+            student, mimi, voice_prompt_path, persona_text_tokens, num_frames,
+            max_silence_fraction, min_unique_token_fraction,
+        )
+    finally:
+        student.train(was_training)
+
+
+@torch.no_grad()
+def _sanity_check_student_impl(
+    student: StudentLMModel,
+    mimi: MimiModel,
+    voice_prompt_path: str,
+    persona_text_tokens: tp.Optional[list[int]],
+    num_frames: int,
+    max_silence_fraction: float,
+    min_unique_token_fraction: float,
+) -> SanityReport:
     from moshi.models.lm import LMGen
 
     notes: list[str] = []

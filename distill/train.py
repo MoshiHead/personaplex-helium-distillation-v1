@@ -124,26 +124,34 @@ def generate_student_rollout(student: StudentLMModel, codes_prompt: torch.Tensor
     placeholder (same convention `LMGen` uses while loading voice/text prompts).
     """
     device = student.device
-    lm_gen = LMGen(student, device=device, use_sampling=True)
-    split = student.audio_offset + AUDIO_TOKENS_PER_STREAM
-    B = codes_prompt.shape[0]
-    with lm_gen.streaming(B):
-        prefix_len = codes_prompt.shape[-1]
-        rollout_out = []
-        for c in range(prefix_len):
-            input_tokens = codes_prompt[:, split:, c:c + 1]
-            moshi_tokens = codes_prompt[:, student.audio_offset:split, c:c + 1]
-            text_token = codes_prompt[:, 0, c]
-            tokens = lm_gen.step(input_tokens=input_tokens, moshi_tokens=moshi_tokens, text_token=text_token)
-            if tokens is not None:
-                rollout_out.append(tokens[:, :, 0])
+    # LMGen asserts the model is not in training mode. compute_losses puts the model back into
+    # train() right after this returns (for the actual gradient step), so don't just assume
+    # whatever mode the caller left it in -- force eval here and restore it afterward.
+    was_training = student.training
+    student.eval()
+    try:
+        lm_gen = LMGen(student, device=device, use_sampling=True)
+        split = student.audio_offset + AUDIO_TOKENS_PER_STREAM
+        B = codes_prompt.shape[0]
+        with lm_gen.streaming(B):
+            prefix_len = codes_prompt.shape[-1]
+            rollout_out = []
+            for c in range(prefix_len):
+                input_tokens = codes_prompt[:, split:, c:c + 1]
+                moshi_tokens = codes_prompt[:, student.audio_offset:split, c:c + 1]
+                text_token = codes_prompt[:, 0, c]
+                tokens = lm_gen.step(input_tokens=input_tokens, moshi_tokens=moshi_tokens, text_token=text_token)
+                if tokens is not None:
+                    rollout_out.append(tokens[:, :, 0])
 
-        sine_frame = lm_gen._encode_sine_frame().expand(B, -1, -1)
-        for _ in range(rollout_frames):
-            tokens = lm_gen.step(input_tokens=sine_frame)
-            if tokens is not None:
-                rollout_out.append(tokens[:, :, 0])
-    return torch.stack(rollout_out, dim=-1)
+            sine_frame = lm_gen._encode_sine_frame().expand(B, -1, -1)
+            for _ in range(rollout_frames):
+                tokens = lm_gen.step(input_tokens=sine_frame)
+                if tokens is not None:
+                    rollout_out.append(tokens[:, :, 0])
+        return torch.stack(rollout_out, dim=-1)
+    finally:
+        student.train(was_training)
 
 
 def compute_losses(
