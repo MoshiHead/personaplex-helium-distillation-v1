@@ -64,6 +64,16 @@ class StudentLMModel(LMModel):
         # init/wiring pipeline against a tiny synthetic teacher instead of
         # requiring a multi-GB download.
         super().__init__(device="meta", dtype=dtype, **(teacher_kwargs or teacher_lm_kwargs()))
+        # `LMModel.__init__` builds `text_linear`, `out_norm`, `depformer_in`, and `linears`
+        # via plain `torch.nn.Linear(...)` / `create_norm_fn(...)` calls with NO device/dtype
+        # kwargs (see moshi/models/lm.py) -- they always land on default CPU/float32 regardless
+        # of the `device="meta", dtype=dtype` passed above. `get_moshi_lm` (loaders.py) papers
+        # over this with a blanket `model.to(device=device, dtype=dtype)` after construction;
+        # without the same fix here these four submodule groups would be real (non-meta, wrong
+        # dtype) tensors, defeating the "near-zero cost" meta build AND making
+        # `load_frozen_from_teacher` below cast teacher weights to float32 (via
+        # `self.text_linear.weight.dtype`) instead of the model's real working dtype.
+        self.to(device="meta", dtype=dtype)
 
         cfg = student_config
         self.student_config = cfg

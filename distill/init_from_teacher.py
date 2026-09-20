@@ -177,11 +177,17 @@ def _gating_hidden_activation(gate: torch.nn.Module, x: torch.Tensor) -> torch.T
     `StreamingTransformerLayer._ff_block` calls `self.gating(x)`) and
     replicating the first half of the kernel here is the only way to observe
     this intermediate value without modifying moshi/modules/gating.py.
+
+    Casts `x` to `gate.linear_in.weight`'s dtype before the matmul regardless
+    of what dtype it arrives in -- callers that capture activations via a
+    forward hook commonly upcast to float32 for numerically stable statistics
+    (e.g. `collect_ffn_hidden_activations` below), while the model itself runs
+    in bf16, and `F.linear` requires both operands to match.
     """
-    proj = F.linear(x, gate.linear_in.weight)
+    proj = F.linear(x.to(gate.linear_in.weight.dtype), gate.linear_in.weight)
     B, T, _ = proj.shape
     proj = proj.view(B, T, 2, -1)
-    return gate.activation(proj[..., 0, :]) * proj[..., 1, :]
+    return (gate.activation(proj[..., 0, :]) * proj[..., 1, :]).float()
 
 
 @torch.no_grad()

@@ -48,14 +48,23 @@ def _tiny_teacher_kwargs() -> dict:
     )
 
 
-def _tiny_teacher() -> LMModel:
+def _tiny_teacher(dtype: torch.dtype = torch.float32) -> LMModel:
     # Intentionally never trained: `init_attention_layer`/`init_ffn_layer` reset
     # `norm1.alpha`/`norm2.alpha` to RMSNorm's default (all-ones) -- this teacher's own
     # norms are ALSO at that same untrained default, so the "lossless at equal width"
     # tests below aren't confounded by a norm-scale mismatch that a real (trained)
     # teacher would have. This is deterministic (both default to 1.0), not a fluke.
+    #
+    # The trailing `.to(device=, dtype=)` matters, not just style: `LMModel.__init__`
+    # builds text_linear/out_norm/depformer_in/linears via plain torch.nn.Linear(...)/
+    # create_norm_fn(...) calls with no device/dtype kwargs (moshi/models/lm.py), so they
+    # silently default to float32 CPU regardless of the dtype= passed to LMModel.__init__.
+    # get_moshi_lm (moshi/models/loaders.py) always re-casts the whole model after
+    # construction for exactly this reason; skipping it here would build a model no real
+    # load path produces (float32 output heads on an otherwise-bf16 model, say).
     torch.manual_seed(0)
-    model = LMModel(device="cpu", dtype=torch.float32, **_tiny_teacher_kwargs())
+    model = LMModel(device="cpu", dtype=dtype, **_tiny_teacher_kwargs())
+    model = model.to(device="cpu", dtype=dtype)
     model.eval()
     return model
 
@@ -97,6 +106,42 @@ def _build_lossless_student(teacher: LMModel, student_config: StudentConfig) -> 
                               teacher_kwargs=_tiny_teacher_kwargs())
     student.load_frozen_from_teacher(teacher.state_dict())
     return student
+
+
+def test_student_frozen_submodules_match_working_dtype():
+    """Regression test for the actual bug hit on a real bf16 teacher (not just its
+    downstream symptom, see test_collect_ffn_hidden_activations_handles_bf16_model):
+    `LMModel.__init__` builds `text_linear`/`out_norm`/`depformer_in`/`linears` via
+    plain `torch.nn.Linear(...)`/`create_norm_fn(...)` calls with no device/dtype
+    kwargs, so on a plain `super().__init__(device="meta", dtype=dtype, ...)` call
+    those four submodule groups silently end up as REAL (non-meta!) float32 CPU
+    tensors regardless of `dtype`. `StudentLMModel.__init__` must force them onto
+    meta+`dtype` itself (mirroring what `get_moshi_lm`'s trailing `.to()` call does
+    for the real teacher) before `load_frozen_from_teacher` casts the teacher's
+    weights to `self.text_linear.weight.dtype` -- otherwise that cast target is
+    silently float32, producing a model whose output heads don't match the dtype
+    of everything else, which crashes the moment two of them meet in a matmul
+    (e.g. `text_linear(bridge_output)` in `forward_embeddings`).
+    """
+    try:
+        _ = torch.zeros(1, 1, 4, dtype=torch.bfloat16) @ torch.zeros(4, 4, dtype=torch.bfloat16)
+    except RuntimeError:
+        import pytest
+        pytest.skip("bf16 matmul not supported on this device")
+
+    teacher = _tiny_teacher(dtype=torch.bfloat16)
+    student_config = _tiny_student_config()
+    student = StudentLMModel(student_config, device="cpu", dtype=torch.bfloat16,
+                              teacher_kwargs=_tiny_teacher_kwargs())
+    student.load_frozen_from_teacher(teacher.state_dict())
+
+    for name in ("text_linear.weight", "out_norm.alpha", "depformer_in.0.weight", "linears.0.weight"):
+        param = dict(student.named_parameters())[name]
+        assert param.dtype == torch.bfloat16, f"{name} is {param.dtype}, expected bfloat16"
+
+    eval_codes = _random_codes(teacher, batch=1, frames=4, seed=7)
+    with torch.no_grad():
+        student.forward_train(eval_codes)  # would raise the dtype-mismatch RuntimeError if unfixed
 
 
 def test_attention_and_ffn_transforms_are_lossless_pre_bridge():
@@ -201,3 +246,30 @@ def test_sanity_check_flags_degenerate_output():
     report = SanityReport(passed=False, silence_frame_fraction=0.95, unique_token_fraction=0.01,
                            nan_or_inf=False, notes=["collapse"])
     assert not report.passed
+
+
+def test_collect_ffn_hidden_activations_handles_bf16_model():
+    """Regression test: on a real (bf16) teacher, `collect_ffn_hidden_activations`
+    upcasts captured activations to float32 for numerically stable statistics,
+    but `_gating_hidden_activation` then matmuls them against the model's real
+    bf16 `linear_in.weight` -- `F.linear` requires both operands to match, and
+    this crashed the very first time this code ran against a real bf16 teacher
+    on GPU (the CPU-only tests elsewhere in this file all use float32 teachers,
+    which never exercised the mismatch). Skips if bf16 isn't supported on
+    this device (e.g. some CPUs), since that's the whole point of the check.
+    """
+    try:
+        _ = torch.zeros(1, 1, 4, dtype=torch.bfloat16) @ torch.zeros(4, 4, dtype=torch.bfloat16)
+    except RuntimeError:
+        import pytest
+        pytest.skip("bf16 matmul not supported on this device")
+
+    teacher = _tiny_teacher(dtype=torch.bfloat16)
+    codes = _random_codes(teacher, batch=1, frames=6, seed=42)
+
+    def run_teacher(batch):
+        teacher.forward_train(batch)
+
+    hidden_acts = collect_ffn_hidden_activations(teacher.transformer.layers[0].gating, run_teacher, [codes])
+    assert hidden_acts.dtype == torch.float32
+    assert torch.isfinite(hidden_acts).all()
