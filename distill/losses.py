@@ -101,11 +101,20 @@ class RunningNorm:
 
     def __call__(self, value: torch.Tensor) -> torch.Tensor:
         v = float(value.detach().abs().item())
-        if self._mean is None:
-            self._mean = v
-        else:
-            self._mean = self.momentum * self._mean + (1 - self.momentum) * v
-        return value / (self._mean + self.eps)
+        # A single non-finite `value` (e.g. from a degenerate init or a bad batch) must not
+        # permanently corrupt `self._mean` to NaN: the EMA update `momentum*mean + (1-momentum)*nan`
+        # is NaN forever after, silently normalizing every FUTURE (otherwise-healthy) call by NaN
+        # too -- unlike a single bad optimizer step (which a finite-loss check can just skip), this
+        # state has no way to self-correct once corrupted. Skip the update and keep the last-known-
+        # good mean instead; the caller is still responsible for not stepping the optimizer on a
+        # non-finite total loss (see distill/train.py's finite check).
+        if v == v and v not in (float("inf"), float("-inf")):  # finite check without importing math
+            if self._mean is None:
+                self._mean = v
+            else:
+                self._mean = self.momentum * self._mean + (1 - self.momentum) * v
+        denom = (self._mean if self._mean is not None else 1.0) + self.eps
+        return value / denom
 
     def state_dict(self) -> dict:
         return {"mean": self._mean, "momentum": self.momentum}

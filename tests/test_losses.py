@@ -100,3 +100,45 @@ def test_running_norm_converges_toward_stable_scale():
     val = torch.tensor(10.0)
     outputs = [norm(val).item() for _ in range(20)]
     assert abs(outputs[-1] - 1.0) < 0.05
+
+
+def test_running_norm_survives_nan_input():
+    """Regression test: a single non-finite call used to permanently corrupt
+    `self._mean` to NaN (`momentum*mean + (1-momentum)*nan == nan` forever after),
+    silently normalizing every FUTURE, otherwise-healthy call by NaN too. This
+    happened in practice when a degenerate student init produced an inf bridge
+    loss on step 0 of P1 -- every subsequent step's ce/bridge/hidden terms came
+    out NaN as a result, even though only the FIRST step's data was bad.
+
+    The bad call's own OUTPUT is still (correctly) non-finite -- dividing a NaN
+    numerator by a finite mean is still NaN, and the caller (distill/train.py) is
+    separately responsible for checking total_loss and skipping the optimizer
+    step on it. What must NOT happen is `self._mean` itself becoming NaN, which
+    would corrupt every subsequent, otherwise-healthy call too.
+    """
+    norm = RunningNorm(momentum=0.5)
+    norm(torch.tensor(10.0))
+    mean_before = norm._mean
+
+    norm(torch.tensor(float("nan")))  # this call's own output is expected to be NaN
+    assert norm._mean == mean_before, "a non-finite call must not update the running mean"
+
+    norm(torch.tensor(float("inf")))
+    assert norm._mean == mean_before
+
+    # A healthy call afterward should behave exactly as if the bad calls never happened.
+    recovered = norm(torch.tensor(10.0)).item()
+    assert torch.isfinite(torch.tensor(recovered))
+    assert 0.0 < recovered < 10.0
+
+
+def test_running_norm_handles_nan_as_first_call():
+    """Same guard, but for the case where the VERY FIRST call is non-finite (no
+    prior good mean to fall back on) -- must not raise, and must leave `_mean`
+    unset (None) rather than NaN, so the next healthy call initializes cleanly."""
+    norm = RunningNorm(momentum=0.5)
+    norm(torch.tensor(float("nan")))
+    assert norm._mean is None
+
+    recovered = norm(torch.tensor(10.0)).item()
+    assert torch.isfinite(torch.tensor(recovered))

@@ -277,6 +277,46 @@ def kv_head_bands(num_teacher_heads: int, num_student_kv_heads: int) -> list[lis
     return [list(range(g * band_size, (g + 1) * band_size)) for g in range(num_student_kv_heads)]
 
 
+def _is_identity_projection(proj: Projection, atol: float = 1e-5) -> bool:
+    """True if `proj.down` is (numerically) the identity matrix -- i.e. no actual
+    width reduction or basis rotation is happening (e.g. tests/test_bit_exactness.py's
+    identity-clone student, or any config where student_dim == teacher_dim and no
+    calibration-driven rotation was computed). Used to decide whether a teacher's
+    RMSNorm scale (`alpha`) can be copied to the student directly (exact per-channel
+    correspondence) instead of reset to a neutral ones-vector.
+    """
+    if proj.down.shape[0] != proj.down.shape[1]:
+        return False
+    eye = torch.eye(proj.down.shape[0], device=proj.down.device, dtype=proj.down.dtype)
+    return torch.allclose(proj.down, eye, atol=atol)
+
+
+def _init_norm_alpha(teacher_norm: torch.nn.Module, student_norm: torch.nn.Module, proj: Projection):
+    """Sets `student_norm.alpha` from `teacher_norm.alpha` when the residual basis is
+    unchanged (identity projection), or resets it to ones otherwise.
+
+    RMSNorm normalizes by a SCALAR (`torch.mean(x**2)`, not per-channel) before
+    applying `alpha` elementwise. That means `alpha` does not transfer through an
+    arbitrary change of basis: if `down` genuinely rotates or truncates the residual
+    space, `student_norm(x @ down)` computed with the teacher's `alpha` values (which
+    were learned for teacher-basis channels) would apply the WRONG scale to WRONG
+    channels post-rotation, in general. Resetting to ones there is the safe, neutral
+    choice -- P1 "Align" training calibrates it quickly.
+
+    But when `down` is the identity (no rotation at all -- see `_is_identity_projection`),
+    each student channel IS the corresponding teacher channel, so the teacher's `alpha`
+    is exactly correct and resetting it to ones would be a real, unnecessary numerical
+    regression: this was caught by tests/test_bit_exactness.py's identity-clone check
+    (a real 7B teacher's alpha values are trained, non-uniform -- forcing them to ones
+    produced a large, spurious "reproduction failure" that had nothing to do with the
+    actual attention/FFN weight-transform math).
+    """
+    if _is_identity_projection(proj):
+        student_norm.alpha.data.copy_(teacher_norm.alpha.data.to(student_norm.alpha.dtype))
+    else:
+        torch.nn.init.ones_(student_norm.alpha)
+
+
 @torch.no_grad()
 def init_attention_layer(
     teacher_layer: StreamingTransformerLayer,
@@ -322,10 +362,7 @@ def init_attention_layer(
     w_out_student = down_T @ w_out_sel  # [student_dim, len(q_head_idx)*head_dim]
     attn_s.out_proj.weight.copy_(w_out_student.to(attn_s.out_proj.weight.dtype))
 
-    # Norms: elementwise RMSNorm scale does not transfer through a rotation/projection
-    # of the residual basis -- reinitialize to identity scale (1.0), consistent with a
-    # fresh RMSNorm; the P1 "Align" training phase calibrates these quickly.
-    torch.nn.init.ones_(student_layer.norm1.alpha)
+    _init_norm_alpha(teacher_layer.norm1, student_layer.norm1, proj)
 
 
 # --------------------------------------------------------------------------
@@ -398,7 +435,7 @@ def init_ffn_layer(
     w_out_reduced = down_r.T @ w_out_sel
     gate_s.linear_out.weight.copy_(w_out_reduced.to(gate_s.linear_out.weight.dtype))
 
-    torch.nn.init.ones_(student_layer.norm2.alpha)
+    _init_norm_alpha(teacher_layer.norm2, student_layer.norm2, proj)
 
 
 # --------------------------------------------------------------------------
@@ -420,10 +457,25 @@ def init_embeddings(teacher: LMModel, student: StudentLMModel, proj: Projection)
 # --------------------------------------------------------------------------
 
 @torch.no_grad()
-def init_bridge_least_squares(student: StudentLMModel, teacher: LMModel, batches: tp.Sequence[Batch]):
+def init_bridge_least_squares(student: StudentLMModel, teacher: LMModel, batches: tp.Sequence[Batch],
+                               ridge: float = 1e-3):
     """Regress the Bridge so that `bridge(student_raw_hidden) ~= teacher_raw_hidden`
     (both pre-`out_norm`), giving the frozen depth transformer a roughly correct
     input from step 0 rather than from random init.
+
+    Uses RIDGE (L2-regularized) least squares rather than a raw `torch.linalg.lstsq`
+    solve. The system has `student_dim` unknowns per output column (e.g. 2048 for
+    student_ppx_s); a realistic calibration set (a handful of batches, particularly
+    during a quick/smoke-test run) can easily provide fewer than `student_dim`
+    effective rows, or a near-rank-deficient covariance even with more. A raw lstsq
+    solve in that regime is not guaranteed to be well-behaved -- this surfaced as an
+    actually non-finite ("inf" residual) solution in practice, which then poisoned
+    every OTHER parameter's gradient a few training steps later via
+    `clip_grad_norm_` (a single non-finite gradient makes the whole-model clip
+    coefficient non-finite, corrupting the entire model on that optimizer step).
+    Ridge regression is unconditionally well-posed for `ridge > 0`: adding
+    `ridge * I` to `X^T X` makes it positive-definite even when `X` itself is
+    rank-deficient, at the cost of a small bias toward a smaller-norm solution.
     """
     student.eval()
     teacher.eval()
@@ -437,7 +489,23 @@ def init_bridge_least_squares(student: StudentLMModel, teacher: LMModel, batches
     X = torch.cat(xs, dim=0)
     Y = torch.cat(ys, dim=0)
 
-    solution = torch.linalg.lstsq(X, Y).solution  # [student_dim, teacher_dim], X @ solution ~= Y
+    student_dim = X.shape[-1]
+    xtx = X.T @ X
+    xty = X.T @ Y
+    reg = ridge * torch.diagonal(xtx).mean().clamp_min(1e-6)
+    xtx_reg = xtx + reg * torch.eye(student_dim, device=X.device, dtype=X.dtype)
+    solution = torch.linalg.solve(xtx_reg, xty)  # [student_dim, teacher_dim]
+
+    if not torch.isfinite(solution).all():
+        logger.warning(
+            "Bridge least-squares fit produced non-finite values even with ridge "
+            "regularization -- falling back to a zero-initialized bridge linear weight "
+            "(P1 'Align' training will need to learn it from scratch). This usually means "
+            "the calibration data itself contains NaN/Inf (check your dataset), not just "
+            "an ill-conditioned fit."
+        )
+        solution = torch.zeros_like(solution)
+
     student.bridge.linear.weight.copy_(solution.T.to(student.bridge.linear.weight.dtype))
 
     residual_rms = Y.pow(2).mean(dim=0).sqrt().clamp_min(1e-6)

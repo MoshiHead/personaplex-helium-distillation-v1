@@ -262,9 +262,20 @@ def train(
         selected_teacher_layers = payload["selected_teacher_layers"]
         start_step = payload["step"]
     else:
+        # Cycle through DIFFERENT samples per calibration batch -- `dataset[i] for i in
+        # range(min(len(dataset), 4))` inside a loop over `range(calib_n)` (an earlier version
+        # of this code) always selects the SAME first-4 samples regardless of which of the
+        # `calib_n` "different" batches is being built, badly limiting calibration diversity
+        # (init_bridge_least_squares's ridge regularization keeps a repetitive calibration set
+        # from producing a non-finite fit, but a diverse one is still a materially better fit).
+        calib_batch_size = min(len(dataset), 4)
+        calib_n = min(student_config.init.num_calibration_batches, max(1, len(dataset) // batch_size))
         calibration_batches = [
-            collate_chunks([dataset[i] for i in range(min(len(dataset), 4))], chunk_frames)["codes"].to(device)
-            for _ in range(min(student_config.init.num_calibration_batches, max(1, len(dataset) // batch_size)))
+            collate_chunks(
+                [dataset[(b * calib_batch_size + i) % len(dataset)] for i in range(calib_batch_size)],
+                chunk_frames,
+            )["codes"].to(device)
+            for b in range(calib_n)
         ]
         diag = initialize_student(student, teacher, calibration_batches,
                                    student_config.init.keep_first, student_config.init.keep_last)
@@ -329,17 +340,34 @@ def train(
             prompt_len = max(1, chunk_frames // 4)
             codes = generate_student_rollout(student, codes[:, :, :prompt_len],
                                               rollout_frames=chunk_frames - prompt_len)
+            # LMGen.step() returns None for the first max_delay+1 calls (it buffers for the
+            # codebook delay pattern before yielding a token), so the rollout's returned
+            # `codes` is shorter than `chunk_frames` by a few frames -- re-slice
+            # transition_mask (built from the original, full-length batch) to match, or the
+            # frame_weights broadcast inside compute_losses fails with a shape mismatch.
+            transition_mask = transition_mask[:, :codes.shape[-1]]
 
         student.train()
         total_loss, raw = compute_losses(
             student, teacher, hidden_projections, selected_teacher_layers,
             codes, transition_mask, phase, running_norms, audio_kl_temperature,
         )
+        student.eval()
+
+        if not torch.isfinite(total_loss):
+            # A single non-finite loss corrupts the ENTIRE model if allowed through:
+            # clip_grad_norm_'s total-norm computation becomes non-finite the moment any one
+            # parameter's gradient is, and the resulting non-finite clip coefficient scales
+            # (and so corrupts) every other parameter's gradient on that step. Skip the step
+            # entirely rather than let one bad batch/initialization propagate forward.
+            logger.warning("step=%d phase=%s: non-finite total_loss (%s) -- skipping optimizer "
+                            "step. raw=%s", step, phase.name, total_loss.item(), raw)
+            continue
+
         optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(main_params + depth_params, max_norm=1.0)
         optimizer.step()
-        student.eval()
 
         dt = time.time() - t0
         csv_writer.writerow([step, phase.name, raw["total"], raw["ce_raw"], raw["kl_audio_raw"],

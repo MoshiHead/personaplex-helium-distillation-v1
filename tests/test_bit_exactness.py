@@ -56,7 +56,8 @@ def test_frozen_component_chain_reproduces_teacher_audio():
     from moshi.models.lm import LMGen
     from distill.student_model import StudentLMModel
     from distill.init_from_teacher import (
-        select_query_heads, kv_head_bands, init_attention_layer, init_embeddings, Projection,
+        select_query_heads, kv_head_bands, init_attention_layer, init_ffn_layer, init_embeddings,
+        collect_ffn_hidden_activations, Projection,
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -74,18 +75,22 @@ def test_frozen_component_chain_reproduces_teacher_audio():
                            rms=torch.ones(dim, device=device))
     q_head_idx = select_query_heads(32, 32)
     kv_bands = kv_head_bands(32, 32)
+
+    # Minimal valid calibration batch, just to drive one teacher forward pass for
+    # init_ffn_layer's channel-importance ranking. Since student_hidden == teacher_hidden
+    # here (16896, no reduction), select_ffn_channels selects every channel regardless of
+    # activation values (see its docstring) -- the actual content of this batch doesn't
+    # matter, only that it's shaped like real token codes.
+    calib_codes = torch.randint(0, teacher.card, (1, teacher.num_codebooks, 8), device=device)
+    calib_codes[:, 0] = torch.randint(0, teacher.text_card, (1, 8), device=device)
+
+    def run_teacher(batch):
+        teacher.forward_train(batch)
+
     for teacher_layer, student_layer in zip(teacher.transformer.layers, student.transformer.layers):
         init_attention_layer(teacher_layer, student_layer, q_head_idx, kv_bands, identity)
-        # FFN hidden channels are selected (not rotated -- see init_ffn_layer's docstring for
-        # why an SVD basis change is wrong for a space behind an elementwise nonlinearity), and
-        # here every channel is kept (same intermediate_size as the teacher), so a direct copy
-        # is the exact, degenerate case of that selection.
-        gate_s = student_layer.gating
-        gate_t = teacher_layer.gating
-        gate_s.linear_in.weight.copy_(gate_t.linear_in.weight)
-        gate_s.linear_out.weight.copy_(gate_t.linear_out.weight)
-        torch.nn.init.ones_(student_layer.norm1.alpha)
-        torch.nn.init.ones_(student_layer.norm2.alpha)
+        hidden_acts = collect_ffn_hidden_activations(teacher_layer.gating, run_teacher, [calib_codes])
+        init_ffn_layer(teacher_layer, student_layer, identity, hidden_acts)
     init_embeddings(teacher, student, identity)
     student.bridge.linear.weight.copy_(torch.eye(dim, device=device, dtype=student.bridge.linear.weight.dtype))
     torch.nn.init.ones_(student.bridge.norm.alpha)

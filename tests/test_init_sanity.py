@@ -27,7 +27,7 @@ from distill.student_model import StudentLMModel
 from distill.init_from_teacher import (
     initialize_student, select_layers, compute_layer_scores, compute_activation_projection,
     select_query_heads, kv_head_bands, init_attention_layer, init_ffn_layer, _collect_activations,
-    collect_ffn_hidden_activations,
+    collect_ffn_hidden_activations, Projection,
 )
 
 TEACHER_DIM = 512
@@ -273,3 +273,46 @@ def test_collect_ffn_hidden_activations_handles_bf16_model():
     hidden_acts = collect_ffn_hidden_activations(teacher.transformer.layers[0].gating, run_teacher, [codes])
     assert hidden_acts.dtype == torch.float32
     assert torch.isfinite(hidden_acts).all()
+
+
+def test_norm_alpha_is_copied_not_reset_at_identity_projection():
+    """Regression test for a real bug caught by tests/test_bit_exactness.py against
+    the real (trained) 7B teacher: `init_attention_layer`/`init_ffn_layer` used to
+    unconditionally reset `norm1.alpha`/`norm2.alpha` to ones. That's the right
+    default when the residual basis is genuinely rotated/truncated (RMSNorm's
+    scalar normalization doesn't commute with an arbitrary change of basis -- see
+    compute_activation_projection's docstring), but at an IDENTITY projection (no
+    actual reduction -- exactly tests/test_bit_exactness.py's identity-clone
+    scenario, and only reachable there since `_tiny_teacher()` elsewhere in this
+    file is deliberately never trained, so its alpha already defaults to ones and
+    can't distinguish "copied" from "reset") the teacher's real alpha IS the
+    correct value, and forcing it to ones is a real, avoidable numerical
+    regression -- it produced a spurious ~1.6 max-abs-logit "reproduction failure"
+    on the real teacher that had nothing to do with the actual weight-transform
+    math. Simulates a "trained" teacher here by giving its norms non-uniform
+    alpha values (impossible to distinguish from a bug with an untrained one).
+    """
+    teacher = _tiny_teacher()
+    with torch.no_grad():
+        for layer in teacher.transformer.layers:
+            torch.nn.init.uniform_(layer.norm1.alpha, 0.5, 1.5)
+            torch.nn.init.uniform_(layer.norm2.alpha, 0.5, 1.5)
+
+    student_config = _tiny_student_config()
+    student = _build_lossless_student(teacher, student_config)
+
+    identity = Projection(down=torch.eye(TEACHER_DIM), up=torch.eye(TEACHER_DIM), rms=torch.ones(TEACHER_DIM))
+    q_head_idx = select_query_heads(TEACHER_NUM_HEADS, TEACHER_NUM_HEADS)
+    kv_bands = kv_head_bands(TEACHER_NUM_HEADS, TEACHER_NUM_HEADS)
+    calibration_batches = [_random_codes(teacher, seed=500 + i) for i in range(2)]
+
+    def run_teacher(batch):
+        teacher.forward_train(batch)
+
+    for teacher_layer, student_layer in zip(teacher.transformer.layers, student.transformer.layers):
+        init_attention_layer(teacher_layer, student_layer, q_head_idx, kv_bands, identity)
+        hidden_acts = collect_ffn_hidden_activations(teacher_layer.gating, run_teacher, calibration_batches)
+        init_ffn_layer(teacher_layer, student_layer, identity, hidden_acts)
+
+        assert torch.equal(student_layer.norm1.alpha, teacher_layer.norm1.alpha.to(student_layer.norm1.alpha.dtype))
+        assert torch.equal(student_layer.norm2.alpha, teacher_layer.norm2.alpha.to(student_layer.norm2.alpha.dtype))
