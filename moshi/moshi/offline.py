@@ -244,6 +244,18 @@ def run_inference(
     # 6) Prompt configuration (text + voice)
     # System text tokens (k=0) and agent voice-prompt audio (k=1..dep_q) are forced
     if voice_prompt_path.endswith('.pt'):
+        # A `.pt` voice prompt is a PRE-COMPUTED embedding cache, tied to whichever model
+        # produced it (typically the teacher, via save_voice_prompt_embeddings=True) -- it
+        # skips audio encoding and Mimi entirely, replaying those exact embeddings. That is
+        # only valid for a model with the same embed_codes output width; the student's is
+        # different by construction. Fail here with a clear message rather than deep inside
+        # the first RMSNorm's shape mismatch.
+        assert model == "teacher", (
+            f"{voice_prompt_path} is a pre-computed embedding cache (produced via "
+            "save_voice_prompt_embeddings=True, typically by the teacher) -- it cannot be "
+            "reused for --model student, which has a different embed_codes output width. "
+            "Pass a raw audio (.wav) voice prompt instead."
+        )
         # Load pre-saved voice prompt embeddings
         lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
     else:

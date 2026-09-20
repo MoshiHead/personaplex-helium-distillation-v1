@@ -96,12 +96,13 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False, model_kind: str = "teacher"):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
+        self.model_kind = model_kind
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -163,6 +164,18 @@ class ServerState:
                 
         if self.lm_gen.voice_prompt != voice_prompt_path:
             if voice_prompt_path.endswith('.pt'):
+                # A `.pt` voice prompt is a PRE-COMPUTED embedding cache tied to whichever
+                # model produced it (typically the teacher, via save_voice_prompt_embeddings=
+                # True) -- replaying it into a model with a different embed_codes output
+                # width (the student) fails deep inside the first RMSNorm's shape mismatch.
+                if self.model_kind != "teacher":
+                    raise ValueError(
+                        f"{voice_prompt_path} is a pre-computed embedding cache (produced via "
+                        "save_voice_prompt_embeddings=True, typically by the teacher) -- it "
+                        f"cannot be reused for --model {self.model_kind}, which has a "
+                        "different embed_codes output width. Use a raw audio (.wav) voice "
+                        "prompt instead."
+                    )
                 # Load pre-saved voice prompt embeddings
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
@@ -469,6 +482,7 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        model_kind=args.model,
     )
     logger.info("warming up the model")
     state.warmup()

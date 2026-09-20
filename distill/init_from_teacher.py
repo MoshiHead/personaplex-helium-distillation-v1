@@ -480,6 +480,10 @@ def sanity_check_student(
     (voice prompt -> silence -> text prompt -> silence, via `LMGen.step_system_prompts`),
     then lets the student free-run for `num_frames` with a placeholder ("sine") input
     on the other-party channel, same convention used during prompt loading.
+
+    `voice_prompt_path` must be raw audio (.wav), not a `.pt` embedding cache -- those
+    are tied to whichever model produced them (typically the teacher) and are not valid
+    for the student; see the assertion below for why.
     """
     # LMGen asserts the model is not in training mode; nn.Module defaults to training=True,
     # so don't depend on the caller having called .eval() first (build_student_lm does, but a
@@ -507,6 +511,22 @@ def _sanity_check_student_impl(
 ) -> SanityReport:
     from moshi.models.lm import LMGen
 
+    # `.pt` voice-prompt files (e.g. the shipped voices.tgz's NATF2.pt) are PRE-COMPUTED
+    # embeddings -- `LMGen.load_voice_prompt_embeddings` skips audio encoding and Mimi
+    # entirely, replaying `state["embeddings"]` straight into `step_embeddings`. Those
+    # tensors were produced by whichever model originally called
+    # `save_voice_prompt_embeddings=True` (the teacher, at its 4096-dim embed_codes output)
+    # -- they are not just "a voice", they're a specific model's embedding space, and feeding
+    # them into the student's differently-shaped transformer fails with a shape mismatch deep
+    # inside the first RMSNorm rather than at this obviously-wrong call site. Always use raw
+    # audio (.wav) for the student, so it computes its own embeddings via its own embed_codes.
+    assert not voice_prompt_path.endswith(".pt"), (
+        f"{voice_prompt_path} is a pre-computed embedding cache (produced by whichever model "
+        "called save_voice_prompt_embeddings=True, typically the teacher) -- it cannot be "
+        "reused for the student, which has a different embed_codes output width. Pass a raw "
+        "audio (.wav) voice prompt instead, so the student computes its own embeddings."
+    )
+
     notes: list[str] = []
     lm_gen = LMGen(student, device=student.device, use_sampling=True,
                    audio_silence_frame_cnt=int(0.5 * mimi.frame_rate),
@@ -514,10 +534,7 @@ def _sanity_check_student_impl(
     with lm_gen.streaming(1), mimi.streaming(1):
         mimi.reset_streaming()
         lm_gen.reset_streaming()
-        if voice_prompt_path.endswith(".pt"):
-            lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
-        else:
-            lm_gen.load_voice_prompt(voice_prompt_path)
+        lm_gen.load_voice_prompt(voice_prompt_path)
         lm_gen.text_prompt_tokens = persona_text_tokens
         lm_gen.step_system_prompts(mimi)
         mimi.reset_streaming()

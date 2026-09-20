@@ -15,13 +15,13 @@ it can be dropped into `LMGen` exactly like the teacher's transformer.
 
 from contextlib import ExitStack
 from dataclasses import dataclass
+import math
 import typing as tp
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from moshi.modules.rope import RotaryEmbedding
 from moshi.modules.streaming import StreamingModule
 from moshi.modules.transformer import (
     KVCacheResult,
@@ -31,6 +31,39 @@ from moshi.modules.transformer import (
 )
 from moshi.utils.compile import no_compile
 from moshi.modules.gating import make_gating
+
+
+def _apply_rope_single(x: torch.Tensor, offset: torch.Tensor, max_period: float) -> torch.Tensor:
+    """RoPE for a single tensor `x`: [B, H, T, D] (always `time_before_heads=False`
+    layout here). A deliberate reimplementation of the rotation math in
+    `moshi.modules.rope.apply_rope`, NOT a call into it -- that function is
+    decorated `@torch_compile_lazy`, giving it one process-wide compiled-function
+    cache shared with the teacher's `StreamingMultiheadAttention`. Two problems
+    with routing through it here: (1) it takes a `(q, k)` pair, and this module's
+    Q and K have different head counts (GQA), so calling it as `apply_rope(q, q,
+    ...)` / `apply_rope(k, k, ...)` aliases its two arguments -- a pattern the
+    teacher's code never produces, since its own q and k are always distinct
+    tensors; (2) the student's shapes differ from the teacher's, so a shape-
+    triggered recompile of that SHARED compiled function can occur on a call
+    made from inside `LMGen`'s `CUDAGraphed` capture window (`torch.cuda.graph()`
+    requires no new CUDA work -- allocation, compilation, kernel autotuning --
+    during capture). Both produced a real `torch.cuda.graphs.py` capture failure
+    ("operation failed due to a previous error") on an actual GPU. Plain, eager,
+    uncompiled ops here sidestep all of that; RoPE is cheap next to the rest of
+    attention, so there's no real performance cost to not compiling it.
+    """
+    B, H, T, D = x.shape
+    assert D % 2 == 0
+    ds = torch.arange(D // 2, device=x.device, dtype=torch.float32)
+    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
+    ts = (offset.float() + torch.arange(T, device=x.device, dtype=torch.float32)).view(1, 1, -1, 1)
+    xr = x[..., 0::2].float()
+    xi = x[..., 1::2].float()
+    rotr = torch.cos(freqs * ts)
+    roti = torch.sin(freqs * ts)
+    xor = xr * rotr - xi * roti
+    xoi = xr * roti + xi * rotr
+    return torch.stack([xor, xoi], dim=-1).reshape(B, H, T, D).to(x.dtype)
 
 
 @dataclass
@@ -59,7 +92,7 @@ class GQAStreamingMultiheadAttention(StreamingModule[_GQAMHAState]):
         num_kv_heads (int): number of key/value heads. `num_heads % num_kv_heads == 0`.
         causal (bool): causal mask applied automatically.
         context (int, optional): number of past time steps visible to attention.
-        rope (`RotaryEmbedding`, optional): rope embedding to use.
+        max_period (float, optional): RoPE base period; None disables RoPE.
         device, dtype: passed to factory kwargs.
     """
 
@@ -72,7 +105,7 @@ class GQAStreamingMultiheadAttention(StreamingModule[_GQAMHAState]):
         num_kv_heads: int,
         causal: bool = True,
         context: tp.Optional[int] = None,
-        rope: tp.Optional[RotaryEmbedding] = None,
+        max_period: tp.Optional[float] = None,
         device=None,
         dtype=None,
     ):
@@ -88,7 +121,7 @@ class GQAStreamingMultiheadAttention(StreamingModule[_GQAMHAState]):
         self.num_groups = num_heads // num_kv_heads
         self.causal = causal
         self.context = context
-        self.rope = rope
+        self.max_period = max_period
 
         kv_dim = num_kv_heads * self.head_dim
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False, **factory_kwargs)
@@ -134,14 +167,11 @@ class GQAStreamingMultiheadAttention(StreamingModule[_GQAMHAState]):
         k = self.k_proj(key).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(value).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        if self.rope:
-            # `RotaryEmbedding.forward` (moshi/modules/rope.py) asserts q.shape == k.shape --
-            # true for the teacher's plain MHA, but not here: q has `num_heads` heads and k has
-            # `num_kv_heads` (fewer). Rope rotates each head independently (no cross-head
-            # interaction), so q and k are rotated in two separate calls instead of one paired
-            # call; `apply_rope` is not modified.
-            q, _ = self.rope(q, q, offset, time_before_heads=False)
-            k, _ = self.rope(k, k, offset, time_before_heads=False)
+        if self.max_period is not None:
+            # See _apply_rope_single's docstring: deliberately not moshi.modules.rope.apply_rope
+            # (shared, torch.compile-cached, and shaped for a paired q/k of equal head count).
+            q = _apply_rope_single(q, offset, self.max_period)
+            k = _apply_rope_single(k, offset, self.max_period)
 
         k, v, pos_k = self._complete_kv(k, v)
         k = k.repeat_interleave(self.num_groups, dim=1)
@@ -193,7 +223,7 @@ class GQAStreamingTransformerLayer(StreamingModule[_GQALayerState]):
         dim_feedforward: int,
         causal: bool = True,
         context: tp.Optional[int] = None,
-        rope: tp.Optional[RotaryEmbedding] = None,
+        max_period: tp.Optional[float] = None,
         norm: str = "rms_norm_f32",
         layer_scale: tp.Optional[float] = None,
         gating: str = "silu",
@@ -208,7 +238,7 @@ class GQAStreamingTransformerLayer(StreamingModule[_GQALayerState]):
             num_kv_heads=num_kv_heads,
             causal=causal,
             context=context,
-            rope=rope,
+            max_period=max_period,
             **factory_kwargs,
         )
         self.norm1 = create_norm_fn(norm, d_model, **factory_kwargs)
@@ -285,7 +315,6 @@ class GQAStreamingTransformer(StreamingModule[_GQATransformerState]):
         super().__init__()
         self.max_period = max_period
         self.positional_scale = positional_scale
-        self.rope = RotaryEmbedding(max_period=max_period)
 
         self.layers = nn.ModuleList(
             [
@@ -296,7 +325,7 @@ class GQAStreamingTransformer(StreamingModule[_GQATransformerState]):
                     dim_feedforward=dim_feedforward,
                     causal=causal,
                     context=context,
-                    rope=self.rope,
+                    max_period=max_period,
                     norm=norm,
                     layer_scale=layer_scale,
                     gating=gating,
